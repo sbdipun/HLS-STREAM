@@ -1,0 +1,588 @@
+/**
+ * HLS Stream Pro — Player JS
+ * ExoPlayer-style HLS player with full control support
+ */
+
+(function () {
+  'use strict';
+
+  // ─── State ───────────────────────────────────────────────────────────────
+  let hls = null;
+  let streamConfig = null;
+  let controlsTimeout = null;
+  let isFullscreen = false;
+  let statsInterval = null;
+
+  // ─── DOM Refs ─────────────────────────────────────────────────────────────
+  const video         = document.getElementById('videoEl');
+  const playerWrap    = document.getElementById('playerWrap');
+  const exoPlayer     = document.getElementById('exoPlayer');
+  const tapOverlay    = document.getElementById('tapOverlay');
+  const tapPlayBtn    = document.getElementById('tapPlayBtn');
+  const bufferOverlay = document.getElementById('bufferOverlay');
+  const errorOverlay  = document.getElementById('errorOverlay');
+  const errorMsg      = document.getElementById('errorMsg');
+  const retryBtn      = document.getElementById('retryBtn');
+  const centerAnim    = document.getElementById('centerAnim');
+  const exoControls   = document.getElementById('exoControls');
+  const playPauseBtn  = document.getElementById('playPauseBtn');
+  const muteBtn       = document.getElementById('muteBtn');
+  const volumeSlider  = document.getElementById('volumeSlider');
+  const fullscreenBtn = document.getElementById('fullscreenBtn');
+  const pipBtn        = document.getElementById('pipBtn');
+  const settingsBtn   = document.getElementById('settingsBtn');
+  const settingsPanel = document.getElementById('settingsPanel');
+  const qualitySelect = document.getElementById('qualitySelect');
+  const speedPills    = document.querySelectorAll('.speed-pill');
+  const progressBar   = document.getElementById('progressBar');
+  const progressFill  = document.getElementById('progressFill');
+  const progressBuf   = document.getElementById('progressBuffered');
+  const progressThumb = document.getElementById('progressThumb');
+  const currentTime   = document.getElementById('currentTime');
+  const liveIndicator = document.getElementById('liveIndicator');
+  const noStreamMsg   = document.getElementById('noStreamMsg');
+  const channelName   = document.getElementById('channelName');
+  const channelDesc   = document.getElementById('channelDesc');
+  const channelThumb  = document.getElementById('channelThumb');
+  const scheduleList  = document.getElementById('scheduleList');
+  const skipBackBtn   = document.getElementById('skipBackBtn');
+
+  // Stats
+  const statCodec      = document.getElementById('statCodec');
+  const statResolution = document.getElementById('statResolution');
+  const statBitrate    = document.getElementById('statBitrate');
+  const statBuffer     = document.getElementById('statBuffer');
+  const statLatency    = document.getElementById('statLatency');
+
+  // ─── Init ─────────────────────────────────────────────────────────────────
+  async function init() {
+    await loadStreamConfig();
+    await loadSchedule();
+    setupControls();
+  }
+
+  // ─── Load Stream Config ───────────────────────────────────────────────────
+  async function loadStreamConfig() {
+    try {
+      const res = await fetch('/api/stream');
+      if (!res.ok) throw new Error('No config');
+      const data = await res.json();
+      streamConfig = data;
+
+      if (!data.url) {
+        showNoStream();
+        return;
+      }
+
+      updateBanner(data);
+      setupPlayer(data);
+    } catch (e) {
+      // Try localStorage fallback (for demo without CF functions)
+      const local = localStorage.getItem('streamConfig');
+      if (local) {
+        try {
+          const data = JSON.parse(local);
+          if (data.url) {
+            streamConfig = data;
+            updateBanner(data);
+            setupPlayer(data);
+            return;
+          }
+        } catch (_) {}
+      }
+      showNoStream();
+    }
+  }
+
+  function updateBanner(data) {
+    channelName.textContent = data.name || 'Live Stream';
+    channelDesc.textContent = data.description || 'Live broadcast';
+    if (data.thumbnail) {
+      channelThumb.innerHTML = `<img src="${data.thumbnail}" alt="thumb" />`;
+    }
+    liveIndicator.classList.add('visible');
+  }
+
+  function showNoStream() {
+    playerWrap.style.display = 'none';
+    noStreamMsg.style.display = 'flex';
+    document.querySelector('.now-playing-banner').style.display = 'none';
+  }
+
+  // ─── Setup HLS Player ─────────────────────────────────────────────────────
+  function setupPlayer(config) {
+    destroyPlayer();
+
+    const url = config.url;
+    const headers = config.headers || {};
+    const cookies = config.cookies || {};
+
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 90,
+        xhrSetup: function (xhr, reqUrl) {
+          // Inject custom headers
+          Object.entries(headers).forEach(([k, v]) => {
+            try { xhr.setRequestHeader(k, v); } catch (_) {}
+          });
+          // Inject cookies as headers if CORS permits
+          const cookieStr = Object.entries(cookies)
+            .map(([k, v]) => `${k}=${v}`).join('; ');
+          if (cookieStr) {
+            try { xhr.setRequestHeader('Cookie', cookieStr); } catch (_) {}
+          }
+          xhr.withCredentials = !!config.withCredentials;
+        },
+        fetchSetup: function (context, initParams) {
+          // Fetch setup for segment requests
+          const reqHeaders = { ...headers };
+          const cookieStr = Object.entries(cookies)
+            .map(([k, v]) => `${k}=${v}`).join('; ');
+          if (cookieStr) reqHeaders['Cookie'] = cookieStr;
+          return new Request(context.url, {
+            ...initParams,
+            headers: reqHeaders,
+            credentials: config.withCredentials ? 'include' : 'same-origin',
+          });
+        },
+      });
+
+      hls.loadSource(url);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+        populateQualityLevels(data.levels);
+        showTapOverlay();
+        startStatsPolling();
+      });
+
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              hls.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              hls.recoverMediaError();
+              break;
+            default:
+              showError('Fatal stream error. Retrying in 5s...');
+              setTimeout(() => setupPlayer(config), 5000);
+          }
+        }
+      });
+
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        hideBuffering();
+      });
+
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Native HLS (Safari / iOS)
+      video.src = url;
+      showTapOverlay();
+    } else {
+      showError('Your browser does not support HLS streaming.');
+      return;
+    }
+
+    // Video events
+    video.addEventListener('waiting', showBuffering);
+    video.addEventListener('playing', hideBuffering);
+    video.addEventListener('pause', onPause);
+    video.addEventListener('play', onPlay);
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('progress', onProgress);
+    video.addEventListener('volumechange', onVolumeChange);
+  }
+
+  function destroyPlayer() {
+    if (hls) { hls.destroy(); hls = null; }
+    stopStatsPolling();
+    video.removeEventListener('waiting', showBuffering);
+    video.removeEventListener('playing', hideBuffering);
+    video.removeEventListener('pause', onPause);
+    video.removeEventListener('play', onPlay);
+    video.removeEventListener('timeupdate', onTimeUpdate);
+    video.removeEventListener('progress', onProgress);
+    video.removeEventListener('volumechange', onVolumeChange);
+  }
+
+  // ─── Quality Levels ───────────────────────────────────────────────────────
+  function populateQualityLevels(levels) {
+    qualitySelect.innerHTML = '<option value="-1">Auto</option>';
+    levels.forEach((lvl, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `${lvl.height}p${lvl.attrs?.FRAME_RATE ? ` ${Math.round(lvl.attrs.FRAME_RATE)}fps` : ''}`;
+      qualitySelect.appendChild(opt);
+    });
+  }
+
+  qualitySelect.addEventListener('change', () => {
+    if (hls) {
+      const val = parseInt(qualitySelect.value);
+      hls.currentLevel = val;
+    }
+  });
+
+  // ─── Controls Setup ───────────────────────────────────────────────────────
+  function setupControls() {
+    // Play/Pause
+    playPauseBtn.addEventListener('click', togglePlay);
+    tapPlayBtn.addEventListener('click', startPlay);
+
+    // Mute
+    muteBtn.addEventListener('click', toggleMute);
+
+    // Volume
+    volumeSlider.value = 80;
+    video.volume = 0.8;
+    volumeSlider.addEventListener('input', () => {
+      video.volume = volumeSlider.value / 100;
+      video.muted = video.volume === 0;
+      updateMuteIcon();
+    });
+
+    // Fullscreen
+    fullscreenBtn.addEventListener('click', toggleFullscreen);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
+    // PiP
+    pipBtn.addEventListener('click', async () => {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (video.requestPictureInPicture) {
+        await video.requestPictureInPicture();
+      }
+    });
+
+    // Settings
+    settingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = settingsPanel.style.display === 'none';
+      settingsPanel.style.display = isHidden ? 'block' : 'none';
+    });
+    document.addEventListener('click', (e) => {
+      if (!settingsPanel.contains(e.target) && e.target !== settingsBtn) {
+        settingsPanel.style.display = 'none';
+      }
+    });
+
+    // Speed pills
+    speedPills.forEach(pill => {
+      pill.addEventListener('click', () => {
+        speedPills.forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        video.playbackRate = parseFloat(pill.dataset.speed);
+      });
+    });
+
+    // Skip back
+    skipBackBtn.addEventListener('click', () => {
+      video.currentTime = Math.max(0, video.currentTime - 10);
+      showCenterAnim('⏪');
+    });
+
+    // Controls auto-hide
+    exoPlayer.addEventListener('mousemove', showControls);
+    exoPlayer.addEventListener('mouseleave', scheduleHideControls);
+    exoPlayer.addEventListener('click', (e) => {
+      if (e.target === video || e.target === exoPlayer) {
+        togglePlay();
+      }
+    });
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', onKeyDown);
+
+    // Retry
+    retryBtn.addEventListener('click', () => {
+      errorOverlay.style.display = 'none';
+      if (streamConfig) setupPlayer(streamConfig);
+    });
+
+    // Initial controls show
+    showControls();
+  }
+
+  // ─── Playback ─────────────────────────────────────────────────────────────
+  function startPlay() {
+    tapOverlay.classList.add('hidden');
+    video.play().catch(() => {});
+  }
+
+  function togglePlay() {
+    if (tapOverlay && !tapOverlay.classList.contains('hidden')) {
+      startPlay(); return;
+    }
+    if (video.paused) {
+      video.play();
+      showCenterAnim('▶');
+    } else {
+      video.pause();
+      showCenterAnim('⏸');
+    }
+  }
+
+  function showTapOverlay() {
+    tapOverlay.classList.remove('hidden');
+  }
+
+  function onPlay() {
+    playPauseBtn.querySelector('.icon-play').style.display = 'none';
+    playPauseBtn.querySelector('.icon-pause').style.display = '';
+  }
+
+  function onPause() {
+    playPauseBtn.querySelector('.icon-play').style.display = '';
+    playPauseBtn.querySelector('.icon-pause').style.display = 'none';
+  }
+
+  // ─── Volume ───────────────────────────────────────────────────────────────
+  function toggleMute() {
+    video.muted = !video.muted;
+    updateMuteIcon();
+  }
+
+  function updateMuteIcon() {
+    const muted = video.muted || video.volume === 0;
+    muteBtn.querySelector('.icon-vol').style.display = muted ? 'none' : '';
+    muteBtn.querySelector('.icon-mute').style.display = muted ? '' : 'none';
+    if (!muted) volumeSlider.value = video.volume * 100;
+  }
+
+  function onVolumeChange() { updateMuteIcon(); }
+
+  // ─── Progress ─────────────────────────────────────────────────────────────
+  function onTimeUpdate() {
+    if (video.duration && !isNaN(video.duration)) {
+      const pct = (video.currentTime / video.duration) * 100;
+      progressFill.style.width = pct + '%';
+      progressThumb.style.left = pct + '%';
+      const cur = formatTime(video.currentTime);
+      const dur = formatTime(video.duration);
+      currentTime.textContent = `${cur} / ${dur}`;
+    } else {
+      currentTime.textContent = 'LIVE';
+      progressFill.style.width = '100%';
+    }
+  }
+
+  function onProgress() {
+    if (video.buffered.length && video.duration) {
+      const pct = (video.buffered.end(video.buffered.length - 1) / video.duration) * 100;
+      progressBuf.style.width = pct + '%';
+    }
+  }
+
+  function formatTime(s) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return h > 0
+      ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+      : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  }
+
+  // Progress seek (for non-live)
+  progressBar.addEventListener('click', (e) => {
+    if (!video.duration || isNaN(video.duration)) return;
+    const rect = progressBar.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    video.currentTime = pct * video.duration;
+  });
+
+  // ─── Buffering ────────────────────────────────────────────────────────────
+  function showBuffering() {
+    bufferOverlay.classList.add('active');
+  }
+  function hideBuffering() {
+    bufferOverlay.classList.remove('active');
+  }
+
+  // ─── Error ────────────────────────────────────────────────────────────────
+  function showError(msg) {
+    errorMsg.textContent = msg;
+    errorOverlay.style.display = 'flex';
+    hideBuffering();
+  }
+
+  // ─── Controls Visibility ─────────────────────────────────────────────────
+  function showControls() {
+    exoPlayer.classList.remove('controls-hidden');
+    clearTimeout(controlsTimeout);
+    scheduleHideControls();
+  }
+
+  function scheduleHideControls() {
+    clearTimeout(controlsTimeout);
+    if (!video.paused) {
+      controlsTimeout = setTimeout(() => {
+        exoPlayer.classList.add('controls-hidden');
+      }, 3000);
+    }
+  }
+
+  // ─── Fullscreen ───────────────────────────────────────────────────────────
+  function toggleFullscreen() {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      (exoPlayer.requestFullscreen || exoPlayer.webkitRequestFullscreen).call(exoPlayer);
+    } else {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    }
+  }
+
+  function onFullscreenChange() {
+    isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    fullscreenBtn.querySelector('.icon-fs').style.display = isFullscreen ? 'none' : '';
+    fullscreenBtn.querySelector('.icon-exit-fs').style.display = isFullscreen ? '' : 'none';
+  }
+
+  // ─── Center Animation ─────────────────────────────────────────────────────
+  function showCenterAnim(icon) {
+    centerAnim.textContent = icon;
+    centerAnim.classList.remove('show');
+    void centerAnim.offsetWidth; // reflow
+    centerAnim.classList.add('show');
+  }
+
+  // ─── Keyboard Shortcuts ───────────────────────────────────────────────────
+  function onKeyDown(e) {
+    if (['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)) return;
+    switch (e.code) {
+      case 'Space':
+      case 'KeyK':
+        e.preventDefault();
+        togglePlay();
+        break;
+      case 'KeyF':
+        e.preventDefault();
+        toggleFullscreen();
+        break;
+      case 'KeyM':
+        e.preventDefault();
+        toggleMute();
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        video.currentTime = Math.max(0, video.currentTime - 5);
+        showCenterAnim('⏪');
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        video.currentTime += 5;
+        showCenterAnim('⏩');
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        video.volume = Math.min(1, video.volume + 0.1);
+        volumeSlider.value = video.volume * 100;
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        video.volume = Math.max(0, video.volume - 0.1);
+        volumeSlider.value = video.volume * 100;
+        break;
+    }
+    showControls();
+  }
+
+  // ─── Stats Polling ────────────────────────────────────────────────────────
+  function startStatsPolling() {
+    stopStatsPolling();
+    statsInterval = setInterval(updateStats, 2000);
+  }
+
+  function stopStatsPolling() {
+    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+  }
+
+  function updateStats() {
+    if (!hls) return;
+    const level = hls.levels[hls.currentLevel];
+    if (level) {
+      statCodec.textContent = level.videoCodec || 'AVC';
+      statResolution.textContent = level.width && level.height
+        ? `${level.width}×${level.height}`
+        : '—';
+      statBitrate.textContent = level.bitrate
+        ? `${Math.round(level.bitrate / 1000)} kbps`
+        : '—';
+    }
+
+    // Buffer length
+    if (video.buffered.length) {
+      const buf = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      statBuffer.textContent = `${buf.toFixed(1)}s`;
+    }
+
+    // Latency (live only)
+    if (hls.latency !== undefined && hls.latency !== null) {
+      statLatency.textContent = `${hls.latency.toFixed(2)}s`;
+    }
+  }
+
+  // ─── Schedule ─────────────────────────────────────────────────────────────
+  async function loadSchedule() {
+    try {
+      const res = await fetch('/api/schedule');
+      const data = await res.json();
+      renderSchedule(data.items || []);
+    } catch {
+      // Try localStorage
+      const local = localStorage.getItem('scheduleItems');
+      if (local) {
+        try { renderSchedule(JSON.parse(local)); return; } catch (_) {}
+      }
+      renderSchedule([]);
+    }
+  }
+
+  function renderSchedule(items) {
+    if (!items.length) {
+      scheduleList.innerHTML = `
+        <div style="padding:24px 18px;text-align:center;color:rgba(240,240,248,0.3);font-size:0.85rem;">
+          No schedule available
+        </div>`;
+      return;
+    }
+
+    const now = new Date();
+    scheduleList.innerHTML = items.map(item => {
+      const start = new Date(item.startTime);
+      const end   = new Date(item.endTime);
+      const isActive = now >= start && now < end;
+      const isPast   = now >= end;
+      const cls = isActive ? 'active' : isPast ? 'past' : '';
+
+      return `
+        <div class="schedule-item ${cls}">
+          <div class="sched-time">${formatScheduleTime(start)}</div>
+          <div class="sched-content">
+            <div class="sched-title">${escHtml(item.title)}</div>
+            ${item.genre ? `<div class="sched-genre">${escHtml(item.genre)}</div>` : ''}
+            ${isActive ? `<span class="sched-live-tag">● ON AIR</span>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function formatScheduleTime(date) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+  }
+
+  // ─── Start ────────────────────────────────────────────────────────────────
+  init();
+
+})();
