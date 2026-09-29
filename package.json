@@ -4,8 +4,9 @@
   "description": "A professional HLS/M3U8 live streaming platform for Cloudflare Pages",
   "private": true,
   "scripts": {
-    "build": "echo 'No build step needed'",
-    "deploy": "wrangler pages deploy public --project-name=hls-stream-pro",
+    "build": "echo 'Build output ready in public directory'",
+    "deploy": "echo 'Deploy step handled by Cloudflare Pages'",
+    "deploy:local": "wrangler pages deploy public --project-name=hls-stream-pro",
     "dev": "wrangler pages dev public --compatibility-date=2024-01-01",
     "kv:create": "wrangler kv:namespace create STREAM_KV",
     "kv:create-preview": "wrangler kv:namespace create STREAM_KV --preview"
