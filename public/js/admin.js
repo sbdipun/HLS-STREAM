@@ -21,6 +21,7 @@
       thumbnail: '',
       type: 'hls',
       withCredentials: false,
+      useProxy: true,
       active: true,
       headers: {},
       cookies: {},
@@ -48,12 +49,19 @@
   const adminSidebar  = document.getElementById('adminSidebar');
   const toastContainer = document.getElementById('toastContainer');
 
-  // Stream fields
+  // Stream & Import fields
+  const rawCmdInput    = document.getElementById('rawCmdInput');
+  const importCmdBtn   = document.getElementById('importCmdBtn');
+  const clearCmdBtn    = document.getElementById('clearCmdBtn');
+  const cmdParseFeedback = document.getElementById('cmdParseFeedback');
+  const cmdParseFeedbackTxt = document.getElementById('cmdParseFeedbackText');
+
   const fStreamName    = document.getElementById('streamName');
   const fStreamDesc    = document.getElementById('streamDesc');
   const fStreamUrl     = document.getElementById('streamUrl');
   const fStreamThumb   = document.getElementById('streamThumb');
   const fStreamType    = document.getElementById('streamType');
+  const fUseProxy      = document.getElementById('useProxy');
   const fWithCred      = document.getElementById('withCredentials');
   const fStreamActive  = document.getElementById('streamActive');
   const fLowLatency    = document.getElementById('lowLatency');
@@ -225,6 +233,7 @@
     fStreamUrl.value    = c.url || '';
     fStreamThumb.value  = c.thumbnail || '';
     fStreamType.value   = c.type || 'hls';
+    if (fUseProxy) fUseProxy.checked = c.useProxy !== false;
     fWithCred.checked   = c.withCredentials || false;
     fStreamActive.checked = c.active !== false;
     const o = c.hlsOptions || {};
@@ -241,6 +250,7 @@
     state.config.url         = fStreamUrl.value.trim();
     state.config.thumbnail   = fStreamThumb.value.trim();
     state.config.type        = fStreamType.value;
+    state.config.useProxy    = fUseProxy ? fUseProxy.checked : true;
     state.config.withCredentials = fWithCred.checked;
     state.config.active      = fStreamActive.checked;
     state.config.hlsOptions  = {
@@ -262,6 +272,183 @@
       el.classList.remove('active');
       streamStatusTxt.textContent = state.config.url ? 'Inactive' : 'No URL';
     }
+  }
+
+  // ─── Universal Command Parser (Streamlink / cURL / yt-dlp / FFmpeg) ───────
+  function parseCommand(raw) {
+    raw = raw.trim();
+    const result = {
+      url: '',
+      name: '',
+      headers: {},
+      cookies: {},
+      useProxy: true,
+    };
+
+    // 1. Streamlink: --http-header "Key=Value" or --http-header Key=Value
+    const streamlinkRegex = /--http-header\s+["']?([^"'=]+)=([^"'\r\n]+)["']?/gi;
+    let match;
+    while ((match = streamlinkRegex.exec(raw)) !== null) {
+      const key = match[1].trim();
+      const val = match[2].trim();
+      if (key.toLowerCase() === 'cookie') {
+        parseCookieString(val, result.cookies);
+        result.headers['Cookie'] = val;
+      } else {
+        result.headers[key] = val;
+      }
+    }
+
+    // 2. cURL / yt-dlp: -H "Key: Value" or --header "Key: Value" or --add-header "Key:Value"
+    const curlHeaderRegex = /(?:-H|--header|--add-header)\s+["']([^"':]+):\s*([^"']+)["']/gi;
+    while ((match = curlHeaderRegex.exec(raw)) !== null) {
+      const key = match[1].trim();
+      const val = match[2].trim();
+      if (key.toLowerCase() === 'cookie') {
+        parseCookieString(val, result.cookies);
+        result.headers['Cookie'] = val;
+      } else {
+        result.headers[key] = val;
+      }
+    }
+
+    // 3. User-Agent flags: -A "..." or --user-agent "..."
+    const uaMatch = /(?:-A|--user-agent)\s+["']([^"']+)["']/i.exec(raw);
+    if (uaMatch) {
+      result.headers['User-Agent'] = uaMatch[1].trim();
+    }
+
+    // 4. Referer flags: -e "..." or --referer "..."
+    const refMatch = /(?:-e|--referer)\s+["']([^"']+)["']/i.exec(raw);
+    if (refMatch) {
+      result.headers['Referer'] = refMatch[1].trim();
+    }
+
+    // 5. Cookie flags: -b "..." or --cookie "..."
+    const cookieMatch = /(?:-b|--cookie)\s+["']([^"']+)["']/i.exec(raw);
+    if (cookieMatch) {
+      const val = cookieMatch[1].trim();
+      parseCookieString(val, result.cookies);
+      result.headers['Cookie'] = val;
+    }
+
+    // 6. Output filename flag: -o "filename.ts"
+    const outMatch = /-o\s+["']?([^"'\s]+)["']?/i.exec(raw);
+    if (outMatch) {
+      const base = outMatch[1].replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
+      if (base) result.name = base;
+    }
+
+    // 7. Extract Stream URL (support quoted and unquoted HTTP/HTTPS URLs)
+    const quotedUrls = [];
+    const quotedUrlRegex = /["'](https?:\/\/[^"']+)["']/gi;
+    while ((match = quotedUrlRegex.exec(raw)) !== null) {
+      const candidate = match[1];
+      // Skip referer or header URLs
+      if (!raw.includes(`Referer=${candidate}`) && !raw.includes(`Referer: ${candidate}`)) {
+        quotedUrls.push(candidate);
+      }
+    }
+
+    if (quotedUrls.length > 0) {
+      const m3u8Candidate = quotedUrls.find(u => u.includes('.m3u8') || u.includes('.mpd'));
+      result.url = m3u8Candidate || quotedUrls[quotedUrls.length - 1];
+    } else {
+      const unquotedMatch = /(https?:\/\/[^\s"']+)/i.exec(raw);
+      if (unquotedMatch) {
+        result.url = unquotedMatch[1];
+      }
+    }
+
+    // Intelligent name derivation if not extracted from -o
+    if (!result.name) {
+      if (result.headers['Referer']) {
+        try {
+          const refUrl = new URL(result.headers['Referer']);
+          const parts = refUrl.pathname.split('/').filter(Boolean);
+          if (parts.length > 0) {
+            result.name = parts[parts.length - 1].replace(/[-_]+/g, ' ');
+          }
+        } catch (_) {}
+      }
+      if (!result.name && result.url) {
+        try {
+          const u = new URL(result.url);
+          const parts = u.pathname.split('/').filter(Boolean);
+          if (parts.length > 0) {
+            result.name = parts[parts.length - 1].replace(/[-_]+/g, ' ');
+          }
+        } catch (_) {}
+      }
+    }
+
+    return result;
+  }
+
+  function parseCookieString(str, cookieObj) {
+    const parts = str.split(';');
+    for (const part of parts) {
+      const eqIdx = part.indexOf('=');
+      if (eqIdx !== -1) {
+        const k = part.substring(0, eqIdx).trim();
+        const v = part.substring(eqIdx + 1).trim();
+        if (k) cookieObj[k] = v;
+      }
+    }
+  }
+
+  // ─── Import Command Event Listeners ────────────────────────────────────────
+  if (importCmdBtn) {
+    importCmdBtn.addEventListener('click', () => {
+      const raw = rawCmdInput.value.trim();
+      if (!raw) {
+        toast('Please paste a streamlink or curl command first', 'error');
+        return;
+      }
+
+      const parsed = parseCommand(raw);
+      if (!parsed.url) {
+        toast('Could not find a valid stream URL in the command', 'error');
+        return;
+      }
+
+      // Populate basic stream fields
+      fStreamUrl.value = parsed.url;
+      if (parsed.name) {
+        fStreamName.value = parsed.name;
+      }
+      if (fUseProxy) fUseProxy.checked = true;
+      fStreamActive.checked = true;
+
+      // Populate Headers
+      state.config.headers = { ...(state.config.headers || {}), ...parsed.headers };
+      renderHeaders();
+
+      // Populate Cookies
+      state.config.cookies = { ...(state.config.cookies || {}), ...parsed.cookies };
+      renderCookies();
+
+      // Sync form data to state
+      collectFormData();
+      updateStreamStatus();
+
+      const hCount = Object.keys(parsed.headers).length;
+      const cCount = Object.keys(parsed.cookies).length;
+
+      if (cmdParseFeedback && cmdParseFeedbackTxt) {
+        cmdParseFeedbackTxt.textContent = `✓ Imported URL, ${hCount} headers, and ${cCount} cookies! Worker proxy enabled.`;
+        cmdParseFeedback.style.display = 'flex';
+      }
+
+      toast(`Imported: URL, ${hCount} headers, ${cCount} cookies!`, 'success');
+    });
+  }
+
+  if (clearCmdBtn) {
+    clearCmdBtn.addEventListener('click', () => {
+      if (rawCmdInput) rawCmdInput.value = '';
+      if (cmdParseFeedback) cmdParseFeedback.style.display = 'none';
+    });
   }
 
   // ─── URL Test ─────────────────────────────────────────────────────────────
@@ -485,6 +672,17 @@
 
     if (previewHls) { previewHls.destroy(); previewHls = null; }
 
+    let playSource = url;
+    if (state.config.useProxy && !url.startsWith('/api/proxy')) {
+      const hData = { headers: state.config.headers || {}, cookies: state.config.cookies || {} };
+      try {
+        const hParam = btoa(unescape(encodeURIComponent(JSON.stringify(hData))));
+        playSource = `/api/proxy?url=${encodeURIComponent(url)}&h=${encodeURIComponent(hParam)}`;
+      } catch (_) {
+        playSource = `/api/proxy?url=${encodeURIComponent(url)}`;
+      }
+    }
+
     if (Hls.isSupported()) {
       const headers = state.config.headers || {};
       previewHls = new Hls({
@@ -493,11 +691,11 @@
           xhr.withCredentials = state.config.withCredentials;
         },
       });
-      previewHls.loadSource(url);
+      previewHls.loadSource(playSource);
       previewHls.attachMedia(previewVideo);
       previewHls.on(Hls.Events.MANIFEST_PARSED, () => {
         previewVideo.play().catch(() => {});
-        piStatus.textContent = '✓ Playing';
+        piStatus.textContent = state.config.useProxy ? '✓ Playing (via Worker Proxy)' : '✓ Playing';
         piStatus.style.color = '#34d399';
       });
       previewHls.on(Hls.Events.ERROR, (_, d) => {
@@ -507,7 +705,7 @@
         }
       });
     } else if (previewVideo.canPlayType('application/vnd.apple.mpegurl')) {
-      previewVideo.src = url;
+      previewVideo.src = playSource;
       previewVideo.play().catch(() => {});
       piStatus.textContent = '✓ Playing (Native HLS)';
     } else {

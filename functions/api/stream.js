@@ -23,17 +23,24 @@ export async function onRequest(context) {
       const raw = await env.STREAM_KV.get('streamConfig');
       if (raw) {
         const config = JSON.parse(raw);
-        // Strip sensitive data for public endpoint
+        // Strip sensitive data for public endpoint; route via proxy if useProxy is enabled
+        const isProxied = !!config.useProxy || Object.keys(config.cookies || {}).length > 0;
+        const streamUrl = config.active
+          ? (isProxied ? `/api/proxy?url=${encodeURIComponent(config.url)}` : config.url)
+          : null;
+
         const publicConfig = {
-          name:        config.name || '',
-          description: config.description || '',
-          url:         config.active ? config.url : null,
-          thumbnail:   config.thumbnail || '',
-          type:        config.type || 'hls',
+          name:            config.name || '',
+          description:     config.description || '',
+          url:             streamUrl,
+          rawUrl:          config.active ? config.url : null,
+          useProxy:        isProxied,
+          thumbnail:       config.thumbnail || '',
+          type:            config.type || 'hls',
           withCredentials: config.withCredentials || false,
-          headers:     config.active ? (config.headers || {}) : {},
-          cookies:     config.active ? (config.cookies || {}) : {},
-          hlsOptions:  config.hlsOptions || {},
+          headers:         config.active ? (config.headers || {}) : {},
+          cookies:         config.active ? (config.cookies || {}) : {},
+          hlsOptions:      config.hlsOptions || {},
         };
         return new Response(JSON.stringify(publicConfig), { headers: corsHeaders });
       }

@@ -113,9 +113,25 @@
   function setupPlayer(config) {
     destroyPlayer();
 
-    const url = config.url;
+    let streamUrl = config.url;
     const headers = config.headers || {};
     const cookies = config.cookies || {};
+
+    // Auto-proxy if stream requires custom cookies or headers, or if useProxy is explicitly set
+    const needsProxy = !!config.useProxy || Object.keys(cookies).length > 0 || Object.keys(headers).length > 0;
+    if (needsProxy && !streamUrl.startsWith('/api/proxy')) {
+      const hData = { headers, cookies };
+      try {
+        const hParam = btoa(unescape(encodeURIComponent(JSON.stringify(hData))));
+        streamUrl = `/api/proxy?url=${encodeURIComponent(config.url)}&h=${encodeURIComponent(hParam)}`;
+      } catch (_) {
+        streamUrl = `/api/proxy?url=${encodeURIComponent(config.url)}`;
+      }
+    }
+
+    playerWrap.style.display = 'block';
+    noStreamMsg.style.display = 'none';
+    document.querySelector('.now-playing-banner').style.display = 'flex';
 
     if (Hls.isSupported()) {
       hls = new Hls({
@@ -123,33 +139,22 @@
         lowLatencyMode: true,
         backBufferLength: 90,
         xhrSetup: function (xhr, reqUrl) {
-          // Inject custom headers
-          Object.entries(headers).forEach(([k, v]) => {
-            try { xhr.setRequestHeader(k, v); } catch (_) {}
-          });
-          // Inject cookies as headers if CORS permits
-          const cookieStr = Object.entries(cookies)
-            .map(([k, v]) => `${k}=${v}`).join('; ');
-          if (cookieStr) {
-            try { xhr.setRequestHeader('Cookie', cookieStr); } catch (_) {}
+          // Inject custom headers if not proxied
+          if (!needsProxy) {
+            Object.entries(headers).forEach(([k, v]) => {
+              try { xhr.setRequestHeader(k, v); } catch (_) {}
+            });
+            const cookieStr = Object.entries(cookies)
+              .map(([k, v]) => `${k}=${v}`).join('; ');
+            if (cookieStr) {
+              try { xhr.setRequestHeader('Cookie', cookieStr); } catch (_) {}
+            }
           }
           xhr.withCredentials = !!config.withCredentials;
         },
-        fetchSetup: function (context, initParams) {
-          // Fetch setup for segment requests
-          const reqHeaders = { ...headers };
-          const cookieStr = Object.entries(cookies)
-            .map(([k, v]) => `${k}=${v}`).join('; ');
-          if (cookieStr) reqHeaders['Cookie'] = cookieStr;
-          return new Request(context.url, {
-            ...initParams,
-            headers: reqHeaders,
-            credentials: config.withCredentials ? 'include' : 'same-origin',
-          });
-        },
       });
 
-      hls.loadSource(url);
+      hls.loadSource(streamUrl);
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
@@ -180,7 +185,7 @@
 
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Native HLS (Safari / iOS)
-      video.src = url;
+      video.src = streamUrl;
       showTapOverlay();
     } else {
       showError('Your browser does not support HLS streaming.');
@@ -580,6 +585,138 @@
       .replace(/</g,'&lt;')
       .replace(/>/g,'&gt;')
       .replace(/"/g,'&quot;');
+  }
+
+  // ─── Quick Stream Modal Controller ─────────────────────────────────────────
+  const openQuickPlayBtn   = document.getElementById('openQuickPlayBtn');
+  const quickModal         = document.getElementById('quickModal');
+  const closeQuickModalBtn = document.getElementById('closeQuickModalBtn');
+  const cancelQuickModalBtn= document.getElementById('cancelQuickModalBtn');
+  const playQuickCmdBtn    = document.getElementById('playQuickCmdBtn');
+  const quickCmdInput      = document.getElementById('quickCmdInput');
+
+  if (openQuickPlayBtn && quickModal) {
+    openQuickPlayBtn.addEventListener('click', () => {
+      quickModal.style.display = 'flex';
+      if (quickCmdInput) quickCmdInput.focus();
+    });
+
+    const hideQuickModal = () => { quickModal.style.display = 'none'; };
+    if (closeQuickModalBtn) closeQuickModalBtn.addEventListener('click', hideQuickModal);
+    if (cancelQuickModalBtn) cancelQuickModalBtn.addEventListener('click', hideQuickModal);
+    quickModal.addEventListener('click', (e) => {
+      if (e.target === quickModal) hideQuickModal();
+    });
+
+    if (playQuickCmdBtn) {
+      playQuickCmdBtn.addEventListener('click', () => {
+        const raw = quickCmdInput.value.trim();
+        if (!raw) return;
+
+        const parsed = parseQuickCommand(raw);
+        if (!parsed.url) {
+          alert('Could not find a valid stream URL in the input');
+          return;
+        }
+
+        const config = {
+          name: parsed.name || 'Quick Stream',
+          description: 'Live custom stream',
+          url: parsed.url,
+          useProxy: true,
+          headers: parsed.headers,
+          cookies: parsed.cookies,
+          active: true,
+        };
+
+        updateBanner(config);
+        setupPlayer(config);
+        hideQuickModal();
+      });
+    }
+  }
+
+  function parseQuickCommand(raw) {
+    raw = raw.trim();
+    const result = { url: '', name: '', headers: {}, cookies: {} };
+
+    // Streamlink headers
+    const streamlinkRegex = /--http-header\s+["']?([^"'=]+)=([^"'\r\n]+)["']?/gi;
+    let match;
+    while ((match = streamlinkRegex.exec(raw)) !== null) {
+      const k = match[1].trim();
+      const v = match[2].trim();
+      if (k.toLowerCase() === 'cookie') {
+        parseCookieStr(v, result.cookies);
+        result.headers['Cookie'] = v;
+      } else {
+        result.headers[k] = v;
+      }
+    }
+
+    // cURL / yt-dlp headers
+    const curlHeaderRegex = /(?:-H|--header|--add-header)\s+["']([^"':]+):\s*([^"']+)["']/gi;
+    while ((match = curlHeaderRegex.exec(raw)) !== null) {
+      const k = match[1].trim();
+      const v = match[2].trim();
+      if (k.toLowerCase() === 'cookie') {
+        parseCookieStr(v, result.cookies);
+        result.headers['Cookie'] = v;
+      } else {
+        result.headers[k] = v;
+      }
+    }
+
+    // -A / -e / -b
+    const uaMatch = /(?:-A|--user-agent)\s+["']([^"']+)["']/i.exec(raw);
+    if (uaMatch) result.headers['User-Agent'] = uaMatch[1].trim();
+
+    const refMatch = /(?:-e|--referer)\s+["']([^"']+)["']/i.exec(raw);
+    if (refMatch) result.headers['Referer'] = refMatch[1].trim();
+
+    const cookieMatch = /(?:-b|--cookie)\s+["']([^"']+)["']/i.exec(raw);
+    if (cookieMatch) {
+      parseCookieStr(cookieMatch[1].trim(), result.cookies);
+      result.headers['Cookie'] = cookieMatch[1].trim();
+    }
+
+    // Output filename
+    const outMatch = /-o\s+["']?([^"'\s]+)["']?/i.exec(raw);
+    if (outMatch) {
+      result.name = outMatch[1].replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
+    }
+
+    // URL
+    const quotedUrls = [];
+    const quotedUrlRegex = /["'](https?:\/\/[^"']+)["']/gi;
+    while ((match = quotedUrlRegex.exec(raw)) !== null) {
+      const candidate = match[1];
+      if (!raw.includes(`Referer=${candidate}`) && !raw.includes(`Referer: ${candidate}`)) {
+        quotedUrls.push(candidate);
+      }
+    }
+
+    if (quotedUrls.length > 0) {
+      const m3u8Candidate = quotedUrls.find(u => u.includes('.m3u8') || u.includes('.mpd'));
+      result.url = m3u8Candidate || quotedUrls[quotedUrls.length - 1];
+    } else {
+      const unquoted = /(https?:\/\/[^\s"']+)/i.exec(raw);
+      if (unquoted) result.url = unquoted[1];
+    }
+
+    return result;
+  }
+
+  function parseCookieStr(str, obj) {
+    const parts = str.split(';');
+    for (const part of parts) {
+      const eqIdx = part.indexOf('=');
+      if (eqIdx !== -1) {
+        const k = part.substring(0, eqIdx).trim();
+        const v = part.substring(eqIdx + 1).trim();
+        if (k) obj[k] = v;
+      }
+    }
   }
 
   // ─── Start ────────────────────────────────────────────────────────────────

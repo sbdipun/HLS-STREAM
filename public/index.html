@@ -38,6 +38,7 @@
         <span class="live-dot"></span>
         <span>LIVE</span>
       </div>
+      <button class="quick-play-btn" id="openQuickPlayBtn" title="Play custom streamlink or curl command">⚡ Quick Stream</button>
       <a href="/admin" class="admin-btn">Admin</a>
     </div>
   </nav>
@@ -283,6 +284,31 @@
       </div>
     </aside>
   </main>
+
+  <!-- Quick Stream Modal -->
+  <div class="quick-modal-backdrop" id="quickModal" style="display:none;">
+    <div class="quick-modal-card">
+      <div class="quick-modal-header">
+        <div class="quick-modal-title">
+          <span>⚡</span> Quick Stream (Streamlink / cURL / M3U8)
+        </div>
+        <button class="quick-modal-close" id="closeQuickModalBtn">&times;</button>
+      </div>
+      <div class="quick-modal-body">
+        <p class="quick-modal-desc">
+          Paste any raw <code>streamlink</code> command, <code>curl</code> command, or direct <code>.m3u8</code> URL. Headers, CloudFront signed cookies, and proxy are handled automatically.
+        </p>
+        <textarea id="quickCmdInput" class="quick-modal-textarea" rows="4" placeholder='e.g. streamlink --http-header "User-Agent=..." --http-header "Cookie=..." "https://example.com/live.m3u8" best'></textarea>
+        <div class="quick-modal-actions">
+          <button class="btn btn-primary" id="playQuickCmdBtn">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><polygon points="3,1 12,7 3,13"/></svg>
+            Play Stream Now
+          </button>
+          <button class="btn btn-secondary" id="cancelQuickModalBtn">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="/js/player.js"></script>
 </body>

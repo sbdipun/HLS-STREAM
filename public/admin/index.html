@@ -152,6 +152,38 @@
       <!-- Tab: Stream -->
       <div class="tab-content active" id="tab-stream">
         <div class="content-grid">
+          <!-- Raw Command Import Card (Full Width) -->
+          <div class="admin-card span-full" style="grid-column: 1 / -1; border-color: rgba(108, 99, 255, 0.4); background: linear-gradient(135deg, rgba(20, 22, 36, 0.95), rgba(30, 24, 52, 0.85)); box-shadow: 0 8px 32px rgba(108, 99, 255, 0.15);">
+            <div class="card-header-admin">
+              <div class="card-title-admin">
+                <div class="card-icon" style="background:linear-gradient(135deg,#6C63FF,#E040FB);color:#fff">⚡</div>
+                Quick Import from Command
+                <span class="label-badge" style="background:rgba(108,99,255,0.25);color:#c4b5fd;border:1px solid rgba(108,99,255,0.4)">Streamlink / cURL / yt-dlp / FFmpeg</span>
+              </div>
+            </div>
+            <div class="card-body">
+              <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:12px;line-height:1.5;">
+                Paste any raw <code>streamlink</code>, <code>curl</code>, or <code>yt-dlp</code> command containing <code>--http-header</code> or <code>-H</code> with User-Agent, Cookie (e.g. CloudFront signed cookies), Referer, etc. It will auto-populate the Stream URL, all headers, individual cookies, and enable the proxy.
+              </p>
+              <div class="form-group" style="margin-bottom:12px;">
+                <textarea id="rawCmdInput" class="form-input mono" rows="4" style="resize:vertical;font-size:0.82rem;line-height:1.5;background:rgba(10,12,20,0.7);" placeholder='Paste raw command here, e.g.:&#10;streamlink --http-header "User-Agent=..." --http-header "Cookie=..." --http-header "Referer=..." "https://example.com/live.m3u8" best'></textarea>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                <div style="display:flex;gap:10px;align-items:center;">
+                  <button type="button" class="btn btn-primary btn-sm" id="importCmdBtn" style="background:linear-gradient(135deg,#6C63FF,#E040FB);font-weight:600;padding:8px 16px;">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 1v12M1 7l6-6 6 6"/></svg>
+                    Parse &amp; Import Command
+                  </button>
+                  <button type="button" class="btn btn-secondary btn-sm" id="clearCmdBtn">Clear</button>
+                </div>
+                <div id="cmdParseFeedback" style="display:none;font-size:0.82rem;color:#4ade80;align-items:center;gap:6px;">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 7l4 4 6-8"/></svg>
+                  <span id="cmdParseFeedbackText"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- Stream URL Card -->
           <div class="admin-card">
             <div class="card-header-admin">
@@ -203,13 +235,25 @@
                   </select>
                 </div>
                 <div class="form-group">
+                  <label class="form-label">Proxy via Worker</label>
+                  <div class="toggle-wrap">
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="useProxy" checked />
+                      <span class="toggle-slider"></span>
+                    </label>
+                    <span class="toggle-label">Bypasses CORS &amp; sends CloudFront cookies/UA</span>
+                  </div>
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
                   <label class="form-label">With Credentials</label>
                   <div class="toggle-wrap">
                     <label class="toggle-switch">
                       <input type="checkbox" id="withCredentials" />
                       <span class="toggle-slider"></span>
                     </label>
-                    <span class="toggle-label">Send cookies with cross-origin requests</span>
+                    <span class="toggle-label">Send cookies cross-origin in browser</span>
                   </div>
                 </div>
               </div>

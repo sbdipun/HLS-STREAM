@@ -2,6 +2,7 @@ import { onRequest as handleStream } from './functions/api/stream.js';
 import { onRequest as handleSchedule } from './functions/api/schedule.js';
 import { onRequest as handleAdminStream } from './functions/api/admin/stream.js';
 import { onRequest as handleAdminSchedule } from './functions/api/admin/schedule.js';
+import { onRequest as handleProxy } from './functions/api/proxy.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -20,6 +21,9 @@ export default {
     }
     if (pathname === '/api/admin/schedule') {
       return handleAdminSchedule({ request, env, waitUntil: (p) => ctx.waitUntil(p) });
+    }
+    if (pathname === '/api/proxy') {
+      return handleProxy({ request, env, waitUntil: (p) => ctx.waitUntil(p) });
     }
 
     // Serve static assets from public/ directory
