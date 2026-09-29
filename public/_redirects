@@ -1,2 +1,2 @@
-/admin/* /admin/index.html 200
-/api/* /api/:splat 200
+# Cloudflare Pages / Workers static routes
+/admin /admin/index.html 200

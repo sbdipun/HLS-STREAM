@@ -1,13 +1,12 @@
 {
-  "name": "hls-stream-pro",
+  "name": "hls-stream",
   "version": "1.0.0",
-  "description": "A professional HLS/M3U8 live streaming platform for Cloudflare Pages",
+  "description": "A professional HLS/M3U8 live streaming platform for Cloudflare Workers",
   "private": true,
   "scripts": {
     "build": "echo 'Build output ready in public directory'",
-    "deploy": "echo 'Deploy step handled by Cloudflare Pages'",
-    "deploy:local": "wrangler pages deploy public --project-name=hls-stream-pro",
-    "dev": "wrangler pages dev public --compatibility-date=2024-01-01",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --port 8788",
     "kv:create": "wrangler kv:namespace create STREAM_KV",
     "kv:create-preview": "wrangler kv:namespace create STREAM_KV --preview"
   },
