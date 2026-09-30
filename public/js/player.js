@@ -141,8 +141,11 @@
         : 'linear-gradient(135deg,#6C63FF,#E040FB)';
     }
 
-    // Auto-proxy when cookies/headers present
-    const needsProxy = !!config.useProxy || Object.keys(cookies).length > 0 || Object.keys(headers).length > 0;
+    // Determine proxy usage: respect explicit boolean or check headers/cookies
+    const needsProxy = typeof config.useProxy === 'boolean'
+      ? config.useProxy
+      : (Object.keys(cookies).length > 0 || Object.keys(headers).length > 0);
+
     let streamUrl = rawUrl;
     if (needsProxy && !streamUrl.startsWith('/api/proxy')) {
       const hData = { headers, cookies };
@@ -168,16 +171,70 @@
 
       shakaPl = new shaka.Player(video);
 
-      // Network request filter — inject headers for un-proxied requests
-      if (!needsProxy && (Object.keys(headers).length || Object.keys(cookies).length)) {
-        shakaPl.getNetworkingEngine().registerRequestFilter((type, request) => {
-          Object.entries(headers).forEach(([k, v]) => {
-            request.headers[k] = v;
-          });
-          const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
-          if (cookieStr) request.headers['Cookie'] = cookieStr;
+      // DRM ClearKey / License server configuration
+      const clearKey = config.clearKey || config.clearKeys;
+      if (clearKey) {
+        let keysObj = {};
+        if (typeof clearKey === 'string' && clearKey.includes(':')) {
+          const [kid, key] = clearKey.split(':');
+          keysObj[kid.trim().replace(/-/g, '')] = key.trim();
+        } else if (typeof clearKey === 'object') {
+          keysObj = clearKey;
+        }
+        if (Object.keys(keysObj).length > 0) {
+          shakaPl.configure({ drm: { clearKeys: keysObj } });
+        }
+      }
+      if (config.drmLicenseUrl) {
+        shakaPl.configure({
+          drm: {
+            servers: {
+              'com.widevine.alpha': config.drmLicenseUrl,
+              'com.microsoft.playready': config.drmLicenseUrl,
+            }
+          }
         });
       }
+
+      // Network request filter — handles segment tokens and proxying
+      shakaPl.getNetworkingEngine().registerRequestFilter((type, request) => {
+        // 1. Inherit query string tokens (e.g. dazn-token) from rawUrl for all segments
+        if (type === shaka.net.NetworkingEngine.RequestType.SEGMENT || type === shaka.net.NetworkingEngine.RequestType.INIT_SEGMENT) {
+          try {
+            const rawU = new URL(rawUrl);
+            if (rawU.search) {
+              request.uris = request.uris.map(uStr => {
+                try {
+                  const u = new URL(uStr);
+                  rawU.searchParams.forEach((val, key) => {
+                    if (!u.searchParams.has(key)) u.searchParams.set(key, val);
+                  });
+                  return u.href;
+                } catch { return uStr; }
+              });
+            }
+          } catch (_) {}
+        }
+
+        // 2. Wrap into /api/proxy when proxy is enabled
+        if (needsProxy) {
+          let hParam = '';
+          try {
+            hParam = btoa(unescape(encodeURIComponent(JSON.stringify({ headers, cookies }))));
+          } catch (_) {}
+          request.uris = request.uris.map(uStr => {
+            if (uStr.startsWith('/api/proxy') || uStr.includes('/api/proxy?url=')) return uStr;
+            return `/api/proxy?url=${encodeURIComponent(uStr)}${hParam ? '&h=' + encodeURIComponent(hParam) : ''}`;
+          });
+        } else {
+          // Direct fetch: inject headers allowed by browser CORS
+          Object.entries(headers).forEach(([k, v]) => {
+            if (!['user-agent', 'referer', 'cookie', 'host', 'origin'].includes(k.toLowerCase())) {
+              try { request.headers[k] = v; } catch (_) {}
+            }
+          });
+        }
+      });
 
       shakaPl.configure({
         streaming: {
@@ -199,8 +256,15 @@
       shakaPl.addEventListener('error', (e) => {
         const err = e.detail;
         if (err.severity === shaka.util.Error.Severity.CRITICAL) {
-          showError(`DASH error (${err.code}). Retrying in 5s...`);
-          setTimeout(() => setupPlayer(config), 5000);
+          console.error('Shaka critical error:', err);
+          if (err.code === 1001) {
+            showError('Network Error (1001). Upstream server rejected the request. If using Proxy, try unchecking "Route via Proxy".');
+          } else if (err.code === 6001 || err.code === 6006 || err.code === 6012) {
+            showError('Stream is DRM encrypted. A decryption key (--key KID:KEY) or License Server is required.');
+          } else {
+            showError(`DASH error (${err.code}). Retrying in 5s...`);
+            setTimeout(() => setupPlayer(config), 5000);
+          }
         }
       });
 
@@ -214,7 +278,14 @@
         showTapOverlay();
         startStatsPolling();
       } catch (err) {
-        showError(`Failed to load DASH stream: ${err.message || err.code}`);
+        console.error('Shaka load failure:', err);
+        let msg = `Failed to load DASH stream: ${err.message || err.code}`;
+        if (err.code === 1001) {
+          msg = `Network Error (1001 Bad HTTP Status). Upstream rejected the connection. If the stream is Geo/ISP-locked (e.g. DAZN, Jio), uncheck "Route via Proxy" in Quick Stream to connect directly.`;
+        } else if (err.code === 6001 || err.code === 6006 || err.code === 6012) {
+          msg = `Stream is DRM encrypted (Widevine / PlayReady). A decryption key (--key KID:KEY) or DRM License Server is required.`;
+        }
+        showError(msg);
       }
 
     // ── HLS via HLS.js ─────────────────────────────────────────────────────
@@ -756,6 +827,19 @@
       if (e.target === quickModal) hideQuickModal();
     });
 
+    const quickUseProxyEl = document.getElementById('quickUseProxy');
+    const quickDrmKeyEl = document.getElementById('quickDrmKey');
+
+    // Auto uncheck proxy for known Geo/ISP-locked streams when pasting
+    if (quickCmdInput && quickUseProxyEl) {
+      quickCmdInput.addEventListener('input', () => {
+        const val = quickCmdInput.value.toLowerCase();
+        if (val.includes('dazn') || val.includes('jiocinema') || val.includes('hotstar')) {
+          quickUseProxyEl.checked = false;
+        }
+      });
+    }
+
     if (playQuickCmdBtn) {
       playQuickCmdBtn.addEventListener('click', () => {
         const raw = quickCmdInput.value.trim();
@@ -767,12 +851,17 @@
           return;
         }
 
+        const useProxyVal = quickUseProxyEl ? quickUseProxyEl.checked : true;
+        const manualDrmKey = quickDrmKeyEl ? quickDrmKeyEl.value.trim() : '';
+
         const config = {
           name: parsed.name || 'Quick Stream',
           description: 'Live custom stream',
           url: parsed.url,
           rawUrl: parsed.url,
-          useProxy: true,
+          useProxy: useProxyVal,
+          clearKey: manualDrmKey || parsed.clearKey || '',
+          drmLicenseUrl: parsed.drmLicenseUrl || '',
           headers: parsed.headers,
           cookies: parsed.cookies,
           active: true,
@@ -820,7 +909,15 @@
     const cookieMatch = /(?:-b|--cookie)\s+["']([^"']+)["']/i.exec(raw);
     if (cookieMatch) { parseCookieStr(cookieMatch[1].trim(), result.cookies); result.headers['Cookie'] = cookieMatch[1].trim(); }
 
-    // 6. Output filename (-o)
+    // 6. DRM ClearKey: --key "KID:KEY" or --widevine-key "KID:KEY"
+    const keyMatch = /(?:--key|--widevine-key)\s+["']?([a-fA-F0-9]{32}:[a-fA-F0-9]{32})["']?/i.exec(raw);
+    if (keyMatch) result.clearKey = keyMatch[1].trim();
+
+    // 7. DRM License Server: --license-server or --license-url
+    const licMatch = /(?:--license-server|--license-url|--drm-license)\s+["']([^"']+)["']/i.exec(raw);
+    if (licMatch) result.drmLicenseUrl = licMatch[1].trim();
+
+    // 8. Output filename (-o)
     const outMatch = /-o\s+["']?([^"'\s]+)["']?/i.exec(raw);
     if (outMatch) result.name = outMatch[1].replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
 

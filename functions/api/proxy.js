@@ -177,46 +177,47 @@ export async function onRequest(context) {
     // ── MPEG-DASH / MPD manifest rewriting ────────────────────────────────────
     const isDashManifest =
       contentType.includes('dash+xml') ||
-      contentType.includes('application/xml') ||
       cleanTarget.endsWith('.mpd') ||
       targetUrl.includes('.mpd?');
 
     if (isDashManifest) {
       let mpdText = await upstreamRes.text();
+      const hQuery = hParam ? `&amp;h=${encodeURIComponent(hParam)}` : '';
 
-      // Rewrite all SegmentTemplate / BaseURL / SegmentURL src, media, initialization attributes
-      // Strategy: find all http URLs in the XML and proxy-ify them.
-      // Also fix relative BaseURL values.
-
-      // 1. Replace absolute HTTP(S) URLs inside any XML attribute or text content
+      // 1. Rewrite existing <BaseURL> tags (both relative and absolute)
       mpdText = mpdText.replace(
-        /(["'> ])(https?:\/\/[^"'<\s]+)/g,
-        (_, prefix, url) => {
-          return `${prefix}/api/proxy?url=${encodeURIComponent(url)}${hQuery}`;
+        /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
+        (_, openTag, urlText, closeTag) => {
+          const trimmed = urlText.trim();
+          if (trimmed.startsWith('/api/proxy')) return `${openTag}${urlText}${closeTag}`;
+          try {
+            const absUrl = new URL(trimmed, targetUrl).href;
+            return `${openTag}/api/proxy?url=${encodeURIComponent(absUrl)}${hQuery}${closeTag}`;
+          } catch {
+            return `${openTag}${urlText}${closeTag}`;
+          }
         }
       );
 
-      // 2. Rewrite relative BaseURL elements by resolving against the manifest URL
-      const baseUrlMatch = /^(https?:\/\/[^?#]*\/)/i.exec(targetUrl);
-      const baseOrigin = baseUrlMatch ? baseUrlMatch[1] : '';
-
-      if (baseOrigin) {
-        mpdText = mpdText.replace(
-          /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/g,
-          (_, openTag, urlText, closeTag) => {
-            const trimmedUrl = urlText.trim();
-            if (trimmedUrl.startsWith('http') || trimmedUrl.startsWith('/api/proxy')) {
-              return `${openTag}${urlText}${closeTag}`;
-            }
-            try {
-              const absUrl = new URL(trimmedUrl, targetUrl).href;
-              return `${openTag}/api/proxy?url=${encodeURIComponent(absUrl)}${hQuery}${closeTag}`;
-            } catch {
-              return `${openTag}${urlText}${closeTag}`;
-            }
-          }
-        );
+      // 2. If no <BaseURL> exists, inject targetUrl directory as base so relative segments resolve correctly
+      if (!/<BaseURL\b/i.test(mpdText)) {
+        const baseDirMatch = /^(https?:\/\/[^?#]*\/)/i.exec(targetUrl);
+        if (baseDirMatch) {
+          const absBaseDir = baseDirMatch[1];
+          mpdText = mpdText.replace(
+            /(<MPD\b[^>]*>)/i,
+            `$1\n  <BaseURL>${absBaseDir}</BaseURL>`
+          );
+        }
       }
+
+      // 3. Rewrite <Location> tags
+      mpdText = mpdText.replace(
+        /(<Location[^>]*>)(https?:\/\/[^<]+)(<\/Location>)/gi,
+        (_, openTag, locUrl, closeTag) => {
+          return `${openTag}/api/proxy?url=${encodeURIComponent(locUrl.trim())}${hQuery}${closeTag}`;
+        }
+      );
 
       return new Response(mpdText, {
         status: 200,

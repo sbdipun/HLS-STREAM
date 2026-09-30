@@ -301,6 +301,19 @@
           Paste any raw <code>streamlink</code> or <code>curl</code> command, or a direct <code>.m3u8</code>/<code>.mpd</code> URL. Headers, tokens, CloudFront cookies, and proxy are handled automatically. Both <strong>HLS</strong> and <strong>MPEG-DASH</strong> streams are supported.
         </p>
         <textarea id="quickCmdInput" class="quick-modal-textarea" rows="5" placeholder='Paste streamlink/curl command or URL — both HLS (.m3u8) and DASH (.mpd) supported:&#10;&#10;streamlink --http-header "User-Agent=..." --http-header "Referer=..." "https://example.com/stream.mpd" best&#10;&#10;or just: https://example.com/stream.mpd?token=...'></textarea>
+        <div style="margin: 12px 0 16px 0; display: flex; flex-direction: column; gap: 10px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #e4e4e7; cursor: pointer;">
+              <input type="checkbox" id="quickUseProxy" checked style="accent-color: #6C63FF; width: 16px; height: 16px; cursor: pointer;">
+              <span>Route via Cloudflare Proxy</span>
+            </label>
+            <span style="font-size: 11px; color: #a1a1aa;">(Uncheck for Geo/ISP-locked streams like DAZN/Jio)</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 12px; color: #a1a1aa; white-space: nowrap;">DRM Key:</span>
+            <input type="text" id="quickDrmKey" placeholder="Optional KID:KEY (hex) or use --key in command" style="flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 6px 10px; color: #fff; font-size: 12px; font-family: monospace;">
+          </div>
+        </div>
         <div class="quick-modal-actions">
           <button class="btn btn-primary" id="playQuickCmdBtn">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><polygon points="3,1 12,7 3,13"/></svg>
