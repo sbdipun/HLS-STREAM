@@ -1,9 +1,9 @@
 /**
-/**
  * GET /api/proxy?url=<targetUrl>&h=<optionalBase64Headers>
- * High-performance Cloudflare Worker proxy for HLS / M3U8 live streams.
+ * Cloudflare Worker proxy for HLS (.m3u8) and MPEG-DASH (.mpd) streams.
  * Injects User-Agent, Referer, and Cookies (e.g. CloudFront signed cookies)
- * and rewrites playlists so segments bypass CORS and browser cookie blocks.
+ * and rewrites manifests so all segments/resources are also fetched via proxy,
+ * bypassing CORS restrictions in the browser.
  */
 
 export async function onRequest(context) {
@@ -123,20 +123,24 @@ export async function onRequest(context) {
     }
 
     const contentType = upstreamRes.headers.get('content-type') || '';
-    const isPlaylist = contentType.includes('mpegurl') ||
-                       contentType.includes('application/x-mpegURL') ||
-                       targetUrl.includes('.m3u8');
+    const cleanTarget = targetUrl.split('?')[0].toLowerCase();
+    const hQuery = hParam ? `&h=${encodeURIComponent(hParam)}` : '';
 
-    if (isPlaylist) {
+    // ── HLS / M3U8 playlist rewriting ────────────────────────────────────────
+    const isHlsPlaylist =
+      contentType.includes('mpegurl') ||
+      contentType.includes('x-mpegurl') ||
+      cleanTarget.endsWith('.m3u8');
+
+    if (isHlsPlaylist) {
       const manifestText = await upstreamRes.text();
       const lines = manifestText.split(/\r?\n/);
-      const hQuery = hParam ? `&h=${encodeURIComponent(hParam)}` : '';
 
       const rewrittenLines = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed) return line;
 
-        // Rewrite encryption keys and init segments: #EXT-X-KEY:...,URI="..."
+        // Rewrite #EXT-X-KEY and #EXT-X-MAP URI attributes
         if (trimmed.startsWith('#EXT-X-KEY') || trimmed.startsWith('#EXT-X-MAP')) {
           return trimmed.replace(/URI=["']([^"']+)["']/g, (_, uri) => {
             try {
@@ -148,12 +152,9 @@ export async function onRequest(context) {
           });
         }
 
-        // Keep standard comment lines
-        if (trimmed.startsWith('#')) {
-          return line;
-        }
+        if (trimmed.startsWith('#')) return line; // other tags — keep as-is
 
-        // Segment or sub-playlist URL
+        // Segment URL (relative or absolute)
         try {
           const absUrl = new URL(trimmed, targetUrl).href;
           return `/api/proxy?url=${encodeURIComponent(absUrl)}${hQuery}`;
@@ -173,7 +174,62 @@ export async function onRequest(context) {
       });
     }
 
-    // Binary segment or key file (.ts, .m4s, .key, etc.)
+    // ── MPEG-DASH / MPD manifest rewriting ────────────────────────────────────
+    const isDashManifest =
+      contentType.includes('dash+xml') ||
+      contentType.includes('application/xml') ||
+      cleanTarget.endsWith('.mpd') ||
+      targetUrl.includes('.mpd?');
+
+    if (isDashManifest) {
+      let mpdText = await upstreamRes.text();
+
+      // Rewrite all SegmentTemplate / BaseURL / SegmentURL src, media, initialization attributes
+      // Strategy: find all http URLs in the XML and proxy-ify them.
+      // Also fix relative BaseURL values.
+
+      // 1. Replace absolute HTTP(S) URLs inside any XML attribute or text content
+      mpdText = mpdText.replace(
+        /(["'> ])(https?:\/\/[^"'<\s]+)/g,
+        (_, prefix, url) => {
+          return `${prefix}/api/proxy?url=${encodeURIComponent(url)}${hQuery}`;
+        }
+      );
+
+      // 2. Rewrite relative BaseURL elements by resolving against the manifest URL
+      const baseUrlMatch = /^(https?:\/\/[^?#]*\/)/i.exec(targetUrl);
+      const baseOrigin = baseUrlMatch ? baseUrlMatch[1] : '';
+
+      if (baseOrigin) {
+        mpdText = mpdText.replace(
+          /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/g,
+          (_, openTag, urlText, closeTag) => {
+            const trimmedUrl = urlText.trim();
+            if (trimmedUrl.startsWith('http') || trimmedUrl.startsWith('/api/proxy')) {
+              return `${openTag}${urlText}${closeTag}`;
+            }
+            try {
+              const absUrl = new URL(trimmedUrl, targetUrl).href;
+              return `${openTag}/api/proxy?url=${encodeURIComponent(absUrl)}${hQuery}${closeTag}`;
+            } catch {
+              return `${openTag}${urlText}${closeTag}`;
+            }
+          }
+        );
+      }
+
+      return new Response(mpdText, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/dash+xml; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+      });
+    }
+
+    // ── Binary segment / init segment / key file (.ts, .m4s, .mp4, .key, …) ─
     const responseHeaders = new Headers(upstreamRes.headers);
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -191,3 +247,4 @@ export async function onRequest(context) {
     });
   }
 }
+

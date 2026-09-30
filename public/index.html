@@ -10,6 +10,8 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/assets/player.css" />
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+  <!-- Shaka Player for MPEG-DASH (MPD) support -->
+  <script src="https://cdn.jsdelivr.net/npm/shaka-player@4.12.4/dist/shaka-player.compiled.js"></script>
 </head>
 <body>
   <!-- Background -->
@@ -69,7 +71,7 @@
         </div>
         <div class="now-playing-badges">
           <span class="badge badge-live">● LIVE</span>
-          <span class="badge badge-hls">HLS</span>
+          <span class="badge badge-hls" id="formatBadge">HLS</span>
           <span class="viewer-count" id="viewerCount">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
               <path d="M7 3a3 3 0 110 6 3 3 0 010-6zm-6 7c0-2 2.7-3.5 6-3.5s6 1.5 6 3.5"/>
@@ -290,15 +292,15 @@
     <div class="quick-modal-card">
       <div class="quick-modal-header">
         <div class="quick-modal-title">
-          <span>⚡</span> Quick Stream (Streamlink / cURL / M3U8)
+          <span>⚡</span> Quick Stream (HLS / DASH / Streamlink / cURL)
         </div>
         <button class="quick-modal-close" id="closeQuickModalBtn">&times;</button>
       </div>
       <div class="quick-modal-body">
         <p class="quick-modal-desc">
-          Paste any raw <code>streamlink</code> command, <code>curl</code> command, or direct <code>.m3u8</code> URL. Headers, CloudFront signed cookies, and proxy are handled automatically.
+          Paste any raw <code>streamlink</code> or <code>curl</code> command, or a direct <code>.m3u8</code>/<code>.mpd</code> URL. Headers, tokens, CloudFront cookies, and proxy are handled automatically. Both <strong>HLS</strong> and <strong>MPEG-DASH</strong> streams are supported.
         </p>
-        <textarea id="quickCmdInput" class="quick-modal-textarea" rows="4" placeholder='e.g. streamlink --http-header "User-Agent=..." --http-header "Cookie=..." "https://example.com/live.m3u8" best'></textarea>
+        <textarea id="quickCmdInput" class="quick-modal-textarea" rows="5" placeholder='Paste streamlink/curl command or URL — both HLS (.m3u8) and DASH (.mpd) supported:&#10;&#10;streamlink --http-header "User-Agent=..." --http-header "Referer=..." "https://example.com/stream.mpd" best&#10;&#10;or just: https://example.com/stream.mpd?token=...'></textarea>
         <div class="quick-modal-actions">
           <button class="btn btn-primary" id="playQuickCmdBtn">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><polygon points="3,1 12,7 3,13"/></svg>

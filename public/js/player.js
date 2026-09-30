@@ -7,11 +7,14 @@
   'use strict';
 
   // ─── State ───────────────────────────────────────────────────────────────
-  let hls = null;
+  let hls         = null;   // HLS.js instance (for .m3u8 streams)
+  let shakaPl     = null;   // Shaka Player instance (for .mpd / DASH streams)
+  let activeType  = 'hls';  // 'hls' | 'dash' | 'native'
   let streamConfig = null;
   let controlsTimeout = null;
   let isFullscreen = false;
   let statsInterval = null;
+  const formatBadge = document.getElementById('formatBadge');
 
   // ─── DOM Refs ─────────────────────────────────────────────────────────────
   const video         = document.getElementById('videoEl');
@@ -109,23 +112,45 @@
     document.querySelector('.now-playing-banner').style.display = 'none';
   }
 
-  // ─── Setup HLS Player ─────────────────────────────────────────────────────
-  function setupPlayer(config) {
+  // ─── Detect Stream Format ─────────────────────────────────────────────────
+  function detectFormat(url) {
+    // Strip query string for extension check, but keep full URL for matching
+    const clean = url.split('?')[0].toLowerCase();
+    if (clean.endsWith('.mpd') || url.includes('.mpd?') || url.includes('/dash/') || url.includes('proto=dash')) {
+      return 'dash';
+    }
+    // m3u8 / hls
+    return 'hls';
+  }
+
+  // ─── Setup Player (HLS + DASH) ────────────────────────────────────────────
+  async function setupPlayer(config) {
     destroyPlayer();
 
-    let streamUrl = config.url;
+    const rawUrl  = config.rawUrl || config.url;
     const headers = config.headers || {};
     const cookies = config.cookies || {};
+    const format  = detectFormat(rawUrl);
+    activeType = format;
 
-    // Auto-proxy if stream requires custom cookies or headers, or if useProxy is explicitly set
+    // Update format badge
+    if (formatBadge) {
+      formatBadge.textContent = format === 'dash' ? 'DASH' : 'HLS';
+      formatBadge.style.background = format === 'dash'
+        ? 'linear-gradient(135deg,#f59e0b,#ef4444)'
+        : 'linear-gradient(135deg,#6C63FF,#E040FB)';
+    }
+
+    // Auto-proxy when cookies/headers present
     const needsProxy = !!config.useProxy || Object.keys(cookies).length > 0 || Object.keys(headers).length > 0;
+    let streamUrl = rawUrl;
     if (needsProxy && !streamUrl.startsWith('/api/proxy')) {
       const hData = { headers, cookies };
       try {
         const hParam = btoa(unescape(encodeURIComponent(JSON.stringify(hData))));
-        streamUrl = `/api/proxy?url=${encodeURIComponent(config.url)}&h=${encodeURIComponent(hParam)}`;
+        streamUrl = `/api/proxy?url=${encodeURIComponent(rawUrl)}&h=${encodeURIComponent(hParam)}`;
       } catch (_) {
-        streamUrl = `/api/proxy?url=${encodeURIComponent(config.url)}`;
+        streamUrl = `/api/proxy?url=${encodeURIComponent(rawUrl)}`;
       }
     }
 
@@ -133,13 +158,72 @@
     noStreamMsg.style.display = 'none';
     document.querySelector('.now-playing-banner').style.display = 'flex';
 
-    if (Hls.isSupported()) {
+    // ── MPEG-DASH via Shaka Player ──────────────────────────────────────────
+    if (format === 'dash' && typeof shaka !== 'undefined') {
+      shaka.polyfill.installAll();
+      if (!shaka.Player.isBrowserSupported()) {
+        showError('Your browser does not support DASH streaming.');
+        return;
+      }
+
+      shakaPl = new shaka.Player(video);
+
+      // Network request filter — inject headers for un-proxied requests
+      if (!needsProxy && (Object.keys(headers).length || Object.keys(cookies).length)) {
+        shakaPl.getNetworkingEngine().registerRequestFilter((type, request) => {
+          Object.entries(headers).forEach(([k, v]) => {
+            request.headers[k] = v;
+          });
+          const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+          if (cookieStr) request.headers['Cookie'] = cookieStr;
+        });
+      }
+
+      shakaPl.configure({
+        streaming: {
+          bufferingGoal: 30,
+          rebufferingGoal: 2,
+          bufferBehind: 30,
+          retryParameters: {
+            maxAttempts: 4,
+            baseDelay: 1000,
+            backoffFactor: 2,
+          },
+        },
+        abr: {
+          enabled: true,
+          defaultBandwidthEstimate: 5e6,
+        },
+      });
+
+      shakaPl.addEventListener('error', (e) => {
+        const err = e.detail;
+        if (err.severity === shaka.util.Error.Severity.CRITICAL) {
+          showError(`DASH error (${err.code}). Retrying in 5s...`);
+          setTimeout(() => setupPlayer(config), 5000);
+        }
+      });
+
+      shakaPl.addEventListener('buffering', (e) => {
+        e.buffering ? showBuffering() : hideBuffering();
+      });
+
+      try {
+        await shakaPl.load(streamUrl);
+        populateQualityLevelsDash();
+        showTapOverlay();
+        startStatsPolling();
+      } catch (err) {
+        showError(`Failed to load DASH stream: ${err.message || err.code}`);
+      }
+
+    // ── HLS via HLS.js ─────────────────────────────────────────────────────
+    } else if (format === 'hls' && Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
         backBufferLength: 90,
-        xhrSetup: function (xhr, reqUrl) {
-          // Inject custom headers if not proxied
+        xhrSetup: function (xhr) {
           if (!needsProxy) {
             Object.entries(headers).forEach(([k, v]) => {
               try { xhr.setRequestHeader(k, v); } catch (_) {}
@@ -158,7 +242,7 @@
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        populateQualityLevels(data.levels);
+        populateQualityLevelsHls(data.levels);
         showTapOverlay();
         startStatsPolling();
       });
@@ -179,16 +263,15 @@
         }
       });
 
-      hls.on(Hls.Events.FRAG_BUFFERED, () => {
-        hideBuffering();
-      });
+      hls.on(Hls.Events.FRAG_BUFFERED, () => hideBuffering());
 
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS (Safari / iOS)
+    } else if (video.canPlayType('application/vnd.apple.mpegurl') || video.canPlayType('application/dash+xml')) {
+      // Native (Safari / iOS — supports both HLS and DASH natively)
+      activeType = 'native';
       video.src = streamUrl;
       showTapOverlay();
     } else {
-      showError('Your browser does not support HLS streaming.');
+      showError('Your browser does not support this stream format.');
       return;
     }
 
@@ -204,7 +287,9 @@
 
   function destroyPlayer() {
     if (hls) { hls.destroy(); hls = null; }
+    if (shakaPl) { shakaPl.destroy(); shakaPl = null; }
     stopStatsPolling();
+    activeType = 'hls';
     video.removeEventListener('waiting', showBuffering);
     video.removeEventListener('playing', hideBuffering);
     video.removeEventListener('pause', onPause);
@@ -212,23 +297,70 @@
     video.removeEventListener('timeupdate', onTimeUpdate);
     video.removeEventListener('progress', onProgress);
     video.removeEventListener('volumechange', onVolumeChange);
+    // Reset quality dropdown
+    qualitySelect.innerHTML = '<option value="-1">Auto</option>';
   }
 
-  // ─── Quality Levels ───────────────────────────────────────────────────────
-  function populateQualityLevels(levels) {
+  // ─── Quality Levels (HLS.js) ──────────────────────────────────────────────
+  function populateQualityLevelsHls(levels) {
     qualitySelect.innerHTML = '<option value="-1">Auto</option>';
-    levels.forEach((lvl, i) => {
+    if (!levels || !levels.length) return;
+    // Sort levels by height descending
+    const sorted = levels
+      .map((lvl, i) => ({ ...lvl, originalIndex: i }))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    sorted.forEach((lvl) => {
       const opt = document.createElement('option');
-      opt.value = i;
-      opt.textContent = `${lvl.height}p${lvl.attrs?.FRAME_RATE ? ` ${Math.round(lvl.attrs.FRAME_RATE)}fps` : ''}`;
+      opt.value = lvl.originalIndex;
+      const fps = lvl.attrs && lvl.attrs.FRAME_RATE ? ` ${Math.round(parseFloat(lvl.attrs.FRAME_RATE))}fps` : '';
+      const label = lvl.height ? `${lvl.height}p${fps}` : `${Math.round((lvl.bitrate || 0) / 1000)}kbps`;
+      opt.textContent = label;
       qualitySelect.appendChild(opt);
     });
   }
 
+  // ─── Quality Levels (Shaka / DASH) ───────────────────────────────────────
+  function populateQualityLevelsDash() {
+    if (!shakaPl) return;
+    qualitySelect.innerHTML = '<option value="auto">Auto</option>';
+    try {
+      const tracks = shakaPl.getVariantTracks();
+      // Deduplicate by height & bandwidth
+      const seen = new Set();
+      const unique = tracks
+        .filter(t => {
+          const key = `${t.height}|${Math.round((t.bandwidth || 0) / 1000)}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+      unique.forEach((t) => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        const fps = t.frameRate ? ` ${Math.round(t.frameRate)}fps` : '';
+        const label = t.height ? `${t.height}p${fps}` : `${Math.round((t.bandwidth || 0) / 1000)}kbps`;
+        opt.textContent = label;
+        qualitySelect.appendChild(opt);
+      });
+    } catch (_) {}
+  }
+
   qualitySelect.addEventListener('change', () => {
-    if (hls) {
-      const val = parseInt(qualitySelect.value);
-      hls.currentLevel = val;
+    const val = qualitySelect.value;
+    if (activeType === 'dash' && shakaPl) {
+      if (val === 'auto' || val === '-1') {
+        shakaPl.configure({ abr: { enabled: true } });
+      } else {
+        shakaPl.configure({ abr: { enabled: false } });
+        const tracks = shakaPl.getVariantTracks();
+        const target = tracks.find(t => String(t.id) === String(val));
+        if (target) shakaPl.selectVariantTrack(target, true);
+      }
+    } else if (activeType === 'hls' && hls) {
+      const level = parseInt(val);
+      hls.currentLevel = isNaN(level) ? -1 : level;
     }
   });
 
@@ -506,27 +638,43 @@
   }
 
   function updateStats() {
-    if (!hls) return;
-    const level = hls.levels[hls.currentLevel];
-    if (level) {
-      statCodec.textContent = level.videoCodec || 'AVC';
-      statResolution.textContent = level.width && level.height
-        ? `${level.width}×${level.height}`
-        : '—';
-      statBitrate.textContent = level.bitrate
-        ? `${Math.round(level.bitrate / 1000)} kbps`
-        : '—';
+    // ── HLS.js stats ───────────────────────────────────────────────────────
+    if (activeType === 'hls' && hls) {
+      const level = hls.levels && hls.levels[hls.currentLevel];
+      if (level) {
+        if (statCodec) statCodec.textContent = level.videoCodec || 'AVC';
+        if (statResolution) statResolution.textContent = level.width && level.height
+          ? `${level.width}×${level.height}` : '—';
+        if (statBitrate) statBitrate.textContent = level.bitrate
+          ? `${Math.round(level.bitrate / 1000)} kbps` : '—';
+      }
+      if (hls.latency !== undefined && hls.latency !== null && statLatency) {
+        statLatency.textContent = `${hls.latency.toFixed(2)}s`;
+      }
     }
 
-    // Buffer length
-    if (video.buffered.length) {
+    // ── Shaka / DASH stats ─────────────────────────────────────────────────
+    if (activeType === 'dash' && shakaPl) {
+      try {
+        const stats    = shakaPl.getStats();
+        const active   = shakaPl.getVariantTracks().find(t => t.active);
+        if (active) {
+          if (statCodec) statCodec.textContent = [active.videoCodec, active.audioCodec].filter(Boolean).join(' / ') || 'DASH';
+          if (statResolution) statResolution.textContent = active.width && active.height
+            ? `${active.width}×${active.height}` : '—';
+          if (statBitrate) statBitrate.textContent = active.bandwidth
+            ? `${Math.round(active.bandwidth / 1000)} kbps` : '—';
+        }
+        if (stats && stats.liveLatency !== undefined && statLatency) {
+          statLatency.textContent = `${stats.liveLatency.toFixed(2)}s`;
+        }
+      } catch (_) {}
+    }
+
+    // ── Buffer (both) ──────────────────────────────────────────────────────
+    if (video.buffered.length && statBuffer) {
       const buf = video.buffered.end(video.buffered.length - 1) - video.currentTime;
       statBuffer.textContent = `${buf.toFixed(1)}s`;
-    }
-
-    // Latency (live only)
-    if (hls.latency !== undefined && hls.latency !== null) {
-      statLatency.textContent = `${hls.latency.toFixed(2)}s`;
     }
   }
 
@@ -623,6 +771,7 @@
           name: parsed.name || 'Quick Stream',
           description: 'Live custom stream',
           url: parsed.url,
+          rawUrl: parsed.url,
           useProxy: true,
           headers: parsed.headers,
           cookies: parsed.cookies,
@@ -640,68 +789,79 @@
     raw = raw.trim();
     const result = { url: '', name: '', headers: {}, cookies: {} };
 
-    // Streamlink headers
+    // 1. Streamlink: --http-header "Key=Value"
     const streamlinkRegex = /--http-header\s+["']?([^"'=]+)=([^"'\r\n]+)["']?/gi;
     let match;
     while ((match = streamlinkRegex.exec(raw)) !== null) {
       const k = match[1].trim();
       const v = match[2].trim();
-      if (k.toLowerCase() === 'cookie') {
-        parseCookieStr(v, result.cookies);
-        result.headers['Cookie'] = v;
-      } else {
-        result.headers[k] = v;
-      }
+      if (k.toLowerCase() === 'cookie') { parseCookieStr(v, result.cookies); result.headers['Cookie'] = v; }
+      else { result.headers[k] = v; }
     }
 
-    // cURL / yt-dlp headers
+    // 2. cURL / yt-dlp: -H "Key: Value" or --header "Key: Value"
     const curlHeaderRegex = /(?:-H|--header|--add-header)\s+["']([^"':]+):\s*([^"']+)["']/gi;
     while ((match = curlHeaderRegex.exec(raw)) !== null) {
       const k = match[1].trim();
       const v = match[2].trim();
-      if (k.toLowerCase() === 'cookie') {
-        parseCookieStr(v, result.cookies);
-        result.headers['Cookie'] = v;
-      } else {
-        result.headers[k] = v;
-      }
+      if (k.toLowerCase() === 'cookie') { parseCookieStr(v, result.cookies); result.headers['Cookie'] = v; }
+      else { result.headers[k] = v; }
     }
 
-    // -A / -e / -b
+    // 3. -A / --user-agent
     const uaMatch = /(?:-A|--user-agent)\s+["']([^"']+)["']/i.exec(raw);
     if (uaMatch) result.headers['User-Agent'] = uaMatch[1].trim();
 
+    // 4. -e / --referer
     const refMatch = /(?:-e|--referer)\s+["']([^"']+)["']/i.exec(raw);
     if (refMatch) result.headers['Referer'] = refMatch[1].trim();
 
+    // 5. -b / --cookie
     const cookieMatch = /(?:-b|--cookie)\s+["']([^"']+)["']/i.exec(raw);
-    if (cookieMatch) {
-      parseCookieStr(cookieMatch[1].trim(), result.cookies);
-      result.headers['Cookie'] = cookieMatch[1].trim();
-    }
+    if (cookieMatch) { parseCookieStr(cookieMatch[1].trim(), result.cookies); result.headers['Cookie'] = cookieMatch[1].trim(); }
 
-    // Output filename
+    // 6. Output filename (-o)
     const outMatch = /-o\s+["']?([^"'\s]+)["']?/i.exec(raw);
-    if (outMatch) {
-      result.name = outMatch[1].replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
-    }
+    if (outMatch) result.name = outMatch[1].replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
 
-    // URL
+    // 7. Extract URL — prioritise .mpd / .m3u8, handle query strings with tokens
     const quotedUrls = [];
     const quotedUrlRegex = /["'](https?:\/\/[^"']+)["']/gi;
     while ((match = quotedUrlRegex.exec(raw)) !== null) {
       const candidate = match[1];
-      if (!raw.includes(`Referer=${candidate}`) && !raw.includes(`Referer: ${candidate}`)) {
-        quotedUrls.push(candidate);
-      }
+      const isReferer = raw.includes(`Referer=${candidate}`) || raw.includes(`Referer: ${candidate}`);
+      if (!isReferer) quotedUrls.push(candidate);
     }
 
     if (quotedUrls.length > 0) {
-      const m3u8Candidate = quotedUrls.find(u => u.includes('.m3u8') || u.includes('.mpd'));
-      result.url = m3u8Candidate || quotedUrls[quotedUrls.length - 1];
+      // Prefer explicit media URLs, including ones with query params containing tokens
+      const mediaUrl = quotedUrls.find(u => {
+        const base = u.split('?')[0].toLowerCase();
+        return base.endsWith('.mpd') || base.endsWith('.m3u8') ||
+               u.includes('.mpd?') || u.includes('/dash/') ||
+               u.includes('proto=dash');
+      });
+      result.url = mediaUrl || quotedUrls[quotedUrls.length - 1];
     } else {
+      // No quoted URL — look for bare URL (e.g. just the URL pasted directly)
       const unquoted = /(https?:\/\/[^\s"']+)/i.exec(raw);
       if (unquoted) result.url = unquoted[1];
+    }
+
+    // 8. Derive name from Referer or URL if not set from -o
+    if (!result.name) {
+      if (result.headers['Referer']) {
+        try {
+          const refParts = new URL(result.headers['Referer']).pathname.split('/').filter(Boolean);
+          if (refParts.length) result.name = refParts[refParts.length - 1].replace(/[-_]+/g, ' ');
+        } catch (_) {}
+      }
+      if (!result.name && result.url) {
+        try {
+          const urlParts = new URL(result.url).pathname.split('/').filter(Boolean);
+          if (urlParts.length) result.name = urlParts[urlParts.length - 1].replace(/\.mpd$|\.m3u8$/i, '').replace(/[-_]+/g, ' ');
+        } catch (_) {}
+      }
     }
 
     return result;
